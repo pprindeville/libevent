@@ -351,6 +351,11 @@ struct evdns_base {
 	int getaddrinfo_ipv4_answered;
 	int getaddrinfo_ipv6_answered;
 
+	int getnameinfo_ipv4_timeouts;
+	int getnameinfo_ipv6_timeouts;
+	int getnameinfo_ipv4_answered;
+	int getnameinfo_ipv6_answered;
+
 	struct search_state *global_search_state;
 
 	TAILQ_HEAD(hosts_list, hosts_entry) hostsdb;
@@ -3914,6 +3919,9 @@ evdns_base_new(struct event_base *event_base, int flags)
 	evutil_set_evdns_getaddrinfo_fn_(evdns_getaddrinfo);
 	evutil_set_evdns_getaddrinfo_cancel_fn_(evdns_getaddrinfo_cancel);
 
+	evutil_set_evdns_getnameinfo_fn_(evdns_getnameinfo);
+	evutil_set_evdns_getnameinfo_cancel_fn_(evdns_getnameinfo_cancel);
+
 	base = mm_malloc(sizeof(struct evdns_base));
 	if (base == NULL)
 		return (NULL);
@@ -4228,6 +4236,12 @@ struct getaddrinfo_subrequest {
 	ev_uint32_t type;
 };
 
+/* A single request for a getnameinfo, either v4 or v6. */
+struct getnameinfo_subrequest {
+	struct evdns_request *r;
+	ev_uint32_t type;
+};
+
 /* State data used to implement an in-progress getaddrinfo. */
 struct evdns_getaddrinfo_request {
 	struct evdns_base *evdns_base;
@@ -4251,6 +4265,42 @@ struct evdns_getaddrinfo_request {
 	/* If we have one request answered and one request still inflight,
 	 * then this field holds the answer from the first request... */
 	struct evutil_addrinfo *pending_result;
+	/* And this event is a timeout that will tell us to cancel the second
+	 * request if it's taking a long time. */
+	struct event timeout;
+
+	/* And this field holds the error code from the first request... */
+	int pending_error;
+	/* If this is set, the user canceled this request. */
+	unsigned user_canceled : 1;
+	/* If this is set, the user can no longer cancel this request; we're
+	 * just waiting for the free. */
+	unsigned request_done : 1;
+};
+
+/* State data used to implement an in-progress getnameinfo. */
+struct evdns_getnameinfo_request {
+	struct evdns_base *evdns_base;
+	/* Copy of the modified 'hints' data that we'll use to build
+	 * answers. */
+	struct evutil_nameinfo hints;
+	/* The callback to invoke when we're done */
+	evdns_getnameinfo_cb user_cb;
+	/* User-supplied data to give to the callback. */
+	void *user_data;
+	/* The port to use when building sockaddrs. */
+	ev_uint16_t port;
+	/* The sub_request for an A record (if any) */
+	struct getnameinfo_subrequest ipv4_request;
+	/* The sub_request for an AAAA record (if any) */
+	struct getnameinfo_subrequest ipv6_request;
+
+	/* The cname result that we were told (if any) */
+	char *cname_result;
+
+	/* If we have one request answered and one request still inflight,
+	 * then this field holds the answer from the first request... */
+	struct evutil_nameinfo *pending_result;
 	/* And this event is a timeout that will tell us to cancel the second
 	 * request if it's taking a long time. */
 	struct event timeout;
@@ -4295,6 +4345,20 @@ free_getaddrinfo_request(struct evdns_getaddrinfo_request *data)
 	 * both callbacks have been invoked is it safe to free the request */
 	if (data->pending_result)
 		evutil_freeaddrinfo(data->pending_result);
+	if (data->cname_result)
+		mm_free(data->cname_result);
+	event_del(&data->timeout);
+	mm_free(data);
+	return;
+}
+
+static void
+free_getnameinfo_request(struct evdns_getnameinfo_request *data)
+{
+	/* DO NOT CALL this if either of the requests is pending.  Only once
+	 * both callbacks have been invoked is it safe to free the request */
+	if (data->pending_result)
+		evutil_freenameinfo(data->pending_result);
 	if (data->cname_result)
 		mm_free(data->cname_result);
 	event_del(&data->timeout);
@@ -4368,9 +4432,72 @@ evdns_getaddrinfo_timeout_cb(evutil_socket_t fd, short what, void *ptr)
 	}
 }
 
+/* Callback: invoked when one request in a mixed-format PTR getnameinfo
+ * request has finished, but the other one took too long to answer. Pass
+ * along the answer we got, and cancel the other request.
+ */
+static void
+evdns_getnameinfo_timeout_cb(evutil_socket_t fd, short what, void *ptr)
+{
+	int v4_timedout = 0, v6_timedout = 0;
+	struct evdns_getnameinfo_request *data = ptr;
+
+	/* Cancel any pending requests, and note which one */
+	if (data->ipv4_request.r) {
+		/* XXXX This does nothing if the request's callback is already
+		 * running (pending_cb is set). */
+		evdns_cancel_request(NULL, data->ipv4_request.r);
+		v4_timedout = 1;
+		EVDNS_LOCK(data->evdns_base);
+		++data->evdns_base->getnameinfo_ipv4_timeouts;
+		EVDNS_UNLOCK(data->evdns_base);
+	}
+	if (data->ipv6_request.r) {
+		/* XXXX This does nothing if the request's callback is already
+		 * running (pending_cb is set). */
+		evdns_cancel_request(NULL, data->ipv6_request.r);
+		v6_timedout = 1;
+		EVDNS_LOCK(data->evdns_base);
+		++data->evdns_base->getnameinfo_ipv6_timeouts;
+		EVDNS_UNLOCK(data->evdns_base);
+	}
+
+	/* We only use this timeout callback when we have an answer for
+	 * one address. */
+	EVUTIL_ASSERT(!v4_timedout || !v6_timedout);
+
+	/* Report the outcome of the other request that didn't time out. */
+	if (data->pending_result) {
+		add_cname_to_reply(data, data->pending_result);
+		data->user_cb(0, data->pending_result, data->user_data);
+		data->pending_result = NULL;
+	} else {
+		int e = data->pending_error;
+		if (!e)
+			e = EVUTIL_EAI_AGAIN;
+		data->user_cb(e, NULL, data->user_data);
+	}
+
+	data->user_cb = NULL; /* prevent double-call if evdns callbacks are
+			       * in-progress. XXXX It would be better if this
+			       * weren't necessary. */
+
+	if (!v4_timedout && !v6_timedout) {
+		/* should be impossible? XXXX */
+		free_getnameinfo_request(data);
+	}
+}
+
 static int
 evdns_getaddrinfo_set_timeout(struct evdns_base *evdns_base,
     struct evdns_getaddrinfo_request *data)
+{
+	return event_add(&data->timeout, &evdns_base->global_getaddrinfo_allow_skew);
+}
+
+static int
+evdns_getnameinfo_set_timeout(struct evdns_base *evdns_base,
+    struct evdns_getnameinfo_request *data)
 {
 	return event_add(&data->timeout, &evdns_base->global_getaddrinfo_allow_skew);
 }
@@ -4766,3 +4893,371 @@ evdns_getaddrinfo_cancel(struct evdns_getaddrinfo_request *data)
 		evdns_cancel_request(data->evdns_base, data->ipv6_request.r);
 	EVDNS_UNLOCK(data->evdns_base);
 }
+
+static int
+evdns_getnameinfo_fromhosts(struct evdns_base *base,
+    const char *nodename, struct evutil_nameinfo *hints, ev_uint16_t port,
+    struct evutil_nameinfo **res)
+{
+	int n_found = 0;
+	struct hosts_entry *e;
+	struct evutil_nameinfo *ai=NULL;
+	int f = hints->ai_family;
+
+	EVDNS_LOCK(base);
+	for (e = find_hosts_entry(base, nodename, NULL); e;
+	    e = find_hosts_entry(base, nodename, e)) {
+		struct evutil_nameinfo *ai_new;
+		++n_found;
+		if ((e->addr.sa.sa_family == AF_INET && f == PF_INET6) ||
+		    (e->addr.sa.sa_family == AF_INET6 && f == PF_INET))
+			continue;
+		ai_new = evutil_new_nameinfo_(&e->addr.sa, e->addrlen, hints);
+		if (!ai_new) {
+			n_found = 0;
+			goto out;
+		}
+		sockaddr_setport(ai_new->ai_addr, port);
+		ai = evutil_nameinfo_append_(ai, ai_new);
+	}
+	EVDNS_UNLOCK(base);
+out:
+	if (n_found) {
+		/* Note that we return an empty answer if we found entries for
+		 * this hostname but none were of the right address type. */
+		*res = ai;
+		return 0;
+	} else {
+		if (ai)
+			evutil_freenameinfo(ai);
+		return -1;
+	}
+}
+
+struct evdns_getnameinfo_request *
+evdns_getnameinfo(struct evdns_base *dns_base,
+    const char *nodename, const char *servname,
+    const struct evutil_nameinfo *hints_in,
+    evdns_getnameinfo_cb cb, void *arg)
+{
+	struct evdns_getnameinfo_request *data;
+	struct evutil_nameinfo hints;
+	struct evutil_nameinfo *res = NULL;
+	int err;
+	int port = 0;
+	int want_cname = 0;
+
+	if (!dns_base) {
+		dns_base = current_base;
+		if (!dns_base) {
+			log(EVDNS_LOG_WARN,
+			    "Call to getnameinfo_async with no "
+			    "evdns_base configured.");
+			cb(EVUTIL_EAI_FAIL, NULL, arg); /* ??? better error? */
+			return NULL;
+		}
+	}
+
+	/* If we _must_ answer this immediately, do so. */
+	if ((hints_in && (hints_in->ai_flags & EVUTIL_AI_NUMERICHOST))) {
+		res = NULL;
+		err = evutil_getnameinfo(nodename, servname, hints_in, &res);
+		cb(err, res, arg);
+		return NULL;
+	}
+
+	if (hints_in) {
+		memcpy(&hints, hints_in, sizeof(hints));
+	} else {
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = PF_UNSPEC;
+	}
+
+	evutil_adjust_hints_for_addrconfig_(&hints);
+
+	/* Now try to see if we _can_ answer immediately. */
+	/* (It would be nice to do this by calling getnameinfo directly, with
+	 * AI_NUMERICHOST, on plaforms that have it, but we can't: there isn't
+	 * a reliable way to distinguish the "that wasn't a numeric host!" case
+	 * from any other EAI_NONAME cases.) */
+	err = evutil_getnameinfo_common_(nodename, servname, &hints, &res, &port);
+	if (err != EVUTIL_EAI_NEED_RESOLVE) {
+		cb(err, res, arg);
+		return NULL;
+	}
+
+	/* If there is an entry in the hosts file, we should give it now. */
+	if (!evdns_getnameinfo_fromhosts(dns_base, nodename, &hints, port, &res)) {
+		cb(0, res, arg);
+		return NULL;
+	}
+
+	/* Okay, things are serious now. We're going to need to actually
+	 * launch a request.
+	 */
+	data = mm_calloc(1,sizeof(struct evdns_getnameinfo_request));
+	if (!data) {
+		cb(EVUTIL_EAI_MEMORY, NULL, arg);
+		return NULL;
+	}
+
+	memcpy(&data->hints, &hints, sizeof(data->hints));
+	data->port = (ev_uint16_t)port;
+	data->ipv4_request.type = DNS_IPv4_A;
+	data->ipv6_request.type = DNS_IPv6_AAAA;
+	data->user_cb = cb;
+	data->user_data = arg;
+	data->evdns_base = dns_base;
+
+	want_cname = (hints.ai_flags & EVUTIL_AI_CANONNAME);
+
+	/* If we are asked for a PF_UNSPEC address, we launch two requests in
+	 * parallel: one for an A address and one for an AAAA address.  We
+	 * can't send just one request, since many servers only answer one
+	 * question per DNS request.
+	 *
+	 * Once we have the answer to one request, we allow for a short
+	 * timeout before we report it, to see if the other one arrives.  If
+	 * they both show up in time, then we report both the answers.
+	 *
+	 * If too many addresses of one type time out or fail, we should stop
+	 * launching those requests. (XXX we don't do that yet.)
+	 */
+
+	if (hints.ai_family != PF_INET6) {
+		log(EVDNS_LOG_DEBUG, "Sending request for %s on ipv4 as %p",
+		    nodename, &data->ipv4_request);
+
+		data->ipv4_request.r = evdns_base_resolve_ipv4(dns_base,
+		    nodename, 0, evdns_getnameinfo_gotresolve,
+		    &data->ipv4_request);
+		if (want_cname && data->ipv4_request.r)
+			data->ipv4_request.r->current_req->put_cname_in_ptr =
+			    &data->cname_result;
+	}
+	if (hints.ai_family != PF_INET) {
+		log(EVDNS_LOG_DEBUG, "Sending request for %s on ipv6 as %p",
+		    nodename, &data->ipv6_request);
+
+		data->ipv6_request.r = evdns_base_resolve_ipv6(dns_base,
+		    nodename, 0, evdns_getnameinfo_gotresolve,
+		    &data->ipv6_request);
+		if (want_cname && data->ipv6_request.r)
+			data->ipv6_request.r->current_req->put_cname_in_ptr =
+			    &data->cname_result;
+	}
+
+	evtimer_assign(&data->timeout, dns_base->event_base,
+	    evdns_getnameinfo_timeout_cb, data);
+
+	if (data->ipv4_request.r || data->ipv6_request.r) {
+		return data;
+	} else {
+		mm_free(data);
+		cb(EVUTIL_EAI_FAIL, NULL, arg);
+		return NULL;
+	}
+}
+
+void
+evdns_getnameinfo_cancel(struct evdns_getnameinfo_request *data)
+{
+	EVDNS_LOCK(data->evdns_base);
+	if (data->request_done) {
+		EVDNS_UNLOCK(data->evdns_base);
+		return;
+	}
+	event_del(&data->timeout);
+	data->user_canceled = 1;
+	if (data->ipv4_request.r)
+		evdns_cancel_request(data->evdns_base, data->ipv4_request.r);
+	if (data->ipv6_request.r)
+		evdns_cancel_request(data->evdns_base, data->ipv6_request.r);
+	EVDNS_UNLOCK(data->evdns_base);
+}
+
+static void
+evdns_getnameinfo_gotresolve(int result, char type, int count,
+    int ttl, void *addresses, void *arg)
+{
+	int i;
+	struct getnameinfo_subrequest *req = arg;
+	struct getnameinfo_subrequest *other_req;
+	struct evdns_getnameinfo_request *data;
+
+	struct evutil_nameinfo *res;
+
+	struct sockaddr_in sin;
+	struct sockaddr_in6 sin6;
+	struct sockaddr *sa;
+	int socklen, addrlen;
+	void *addrp;
+	int err;
+	int user_canceled;
+
+	EVUTIL_ASSERT(req->type == DNS_IPv4_A || req->type == DNS_IPv6_AAAA);
+	if (req->type == DNS_IPv4_A) {
+		data = EVUTIL_UPCAST(req, struct evdns_getnameinfo_request, ipv4_request);
+		other_req = &data->ipv6_request;
+	} else {
+		data = EVUTIL_UPCAST(req, struct evdns_getnameinfo_request, ipv6_request);
+		other_req = &data->ipv4_request;
+	}
+
+	/** Called from evdns_base_free() with @fail_requests == 1 */
+	if (result != DNS_ERR_SHUTDOWN) {
+		EVDNS_LOCK(data->evdns_base);
+		if (evdns_result_is_answer(result)) {
+			if (req->type == DNS_IPv4_A)
+				++data->evdns_base->getnameinfo_ipv4_answered;
+			else
+				++data->evdns_base->getnameinfo_ipv6_answered;
+		}
+		user_canceled = data->user_canceled;
+		if (other_req->r == NULL)
+			data->request_done = 1;
+		EVDNS_UNLOCK(data->evdns_base);
+	} else {
+		data->evdns_base = NULL;
+		user_canceled = data->user_canceled;
+	}
+
+	req->r = NULL;
+
+	if (result == DNS_ERR_CANCEL && ! user_canceled) {
+		/* Internal cancel request from timeout or internal error.
+		 * we already answered the user. */
+		if (other_req->r == NULL)
+			free_getnameinfo_request(data);
+		return;
+	}
+
+	if (data->user_cb == NULL) {
+		/* We already answered.  XXXX This shouldn't be needed; see
+		 * comments in evdns_getnameinfo_timeout_cb */
+		free_getnameinfo_request(data);
+		return;
+	}
+
+	if (result == DNS_ERR_NONE) {
+		if (count == 0)
+			err = EVUTIL_EAI_NODATA;
+		else
+			err = 0;
+	} else {
+		err = evdns_err_to_getnameinfo_err(result);
+	}
+
+	if (err) {
+		/* Looks like we got an error. */
+		if (other_req->r) {
+			/* The other request is still working; maybe it will
+			 * succeed. */
+			/* XXXX handle failure from set_timeout */
+			if (result != DNS_ERR_SHUTDOWN) {
+				evdns_getnameinfo_set_timeout(data->evdns_base, data);
+			}
+			data->pending_error = err;
+			return;
+		}
+
+		if (user_canceled) {
+			data->user_cb(EVUTIL_EAI_CANCEL, NULL, data->user_data);
+		} else if (data->pending_result) {
+			/* If we have an answer waiting, and we weren't
+			 * canceled, ignore this error. */
+			add_cname_to_reply(data, data->pending_result);
+			data->user_cb(0, data->pending_result, data->user_data);
+			data->pending_result = NULL;
+		} else {
+			if (data->pending_error)
+				err = getnameinfo_merge_err(err,
+				    data->pending_error);
+			data->user_cb(err, NULL, data->user_data);
+		}
+		free_getnameinfo_request(data);
+		return;
+	} else if (user_canceled) {
+		if (other_req->r) {
+			/* The other request is still working; let it hit this
+			 * callback with EVUTIL_EAI_CANCEL callback and report
+			 * the failure. */
+			return;
+		}
+		data->user_cb(EVUTIL_EAI_CANCEL, NULL, data->user_data);
+		free_getnameinfo_request(data);
+		return;
+	}
+
+	/* Looks like we got some answers. We should turn them into nameinfos
+	 * and then either queue those or return them all. */
+	EVUTIL_ASSERT(type == DNS_IPv4_A || type == DNS_IPv6_AAAA);
+
+	if (type == DNS_IPv4_A) {
+		memset(&sin, 0, sizeof(sin));
+		sin.sin_family = AF_INET;
+		sin.sin_port = htons(data->port);
+
+		sa = (struct sockaddr *)&sin;
+		socklen = sizeof(sin);
+		addrlen = 4;
+		addrp = &sin.sin_addr.s_addr;
+	} else {
+		memset(&sin6, 0, sizeof(sin6));
+		sin6.sin6_family = AF_INET6;
+		sin6.sin6_port = htons(data->port);
+
+		sa = (struct sockaddr *)&sin6;
+		socklen = sizeof(sin6);
+		addrlen = 16;
+		addrp = &sin6.sin6_addr.s6_addr;
+	}
+
+	res = NULL;
+	for (i=0; i < count; ++i) {
+		struct evutil_nameinfo *ai;
+		memcpy(addrp, ((char*)addresses)+i*addrlen, addrlen);
+		ai = evutil_new_nameinfo_(sa, socklen, &data->hints);
+		if (!ai) {
+			if (other_req->r) {
+				evdns_cancel_request(NULL, other_req->r);
+			}
+			data->user_cb(EVUTIL_EAI_MEMORY, NULL, data->user_data);
+			if (res)
+				evutil_freenameinfo(res);
+
+			if (other_req->r == NULL)
+				free_getnameinfo_request(data);
+			return;
+		}
+		res = evutil_nameinfo_append_(res, ai);
+	}
+
+	if (other_req->r) {
+		/* The other request is still in progress; wait for it */
+		/* XXXX handle failure from set_timeout */
+		evdns_getnameinfo_set_timeout(data->evdns_base, data);
+		data->pending_result = res;
+		return;
+	} else {
+		/* The other request is done or never started; append its
+		 * results (if any) and return them. */
+		if (data->pending_result) {
+			if (req->type == DNS_IPv4_A)
+				res = evutil_nameinfo_append_(res,
+				    data->pending_result);
+			else
+				res = evutil_nameinfo_append_(
+				    data->pending_result, res);
+			data->pending_result = NULL;
+		}
+
+		/* Call the user callback. */
+		add_cname_to_reply(data, res);
+		data->user_cb(0, res, data->user_data);
+
+		/* Free data. */
+		free_getnameinfo_request(data);
+	}
+}
+

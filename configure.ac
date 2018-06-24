@@ -475,6 +475,28 @@ AC_CHECK_FUNC(gethostbyname_r, [
 
 fi
 
+AC_CACHE_CHECK(
+    [for getnameinfo],
+    [libevent_cv_getnameinfo],
+    [AC_LINK_IFELSE(
+	[AC_LANG_PROGRAM(
+	    [[
+		#ifdef HAVE_NETDB_H
+		#include <netdb.h>
+		#endif
+	    ]],
+	    [[
+		getnameinfo;
+	    ]]
+	)],
+	[libevent_cv_getnameinfo=yes],
+	[libevent_cv_getnameinfo=no]
+    )]
+)
+if test "$libevent_cv_getnameinfo" = "yes" ; then
+    AC_DEFINE([HAVE_GETNAMEINFO], [1], [Do we have getnameinfo()?])
+fi
+
 AC_MSG_CHECKING(for F_SETFD in fcntl.h)
 AC_EGREP_CPP(yes,
 [

@@ -771,6 +771,48 @@ struct evutil_addrinfo {
 #else
 #define EVUTIL_AI_ADDRCONFIG 0x40000
 #endif
+
+#if defined(NI_NUMERICHOST) && defined(EVENT__HAVE_GETADDRINFO)
+#define EVUTIL_NI_NUMERICHOST NI_NUMERICHOST
+#else
+#define EVUTIL_NI_NUMERICHOST 0x100000
+#endif
+#if defined(NI_NUMERICSERV) && defined(EVENT__HAVE_GETADDRINFO)
+#define EVUTIL_NI_NUMERICSERV NI_NUMERICSERV
+#else
+#define EVUTIL_NI_NUMERICSERV 0x20000
+#endif
+#if defined(NI_NOFQDN) && defined(EVENT__HAVE_GETADDRINFO)
+#define EVUTIL_NI_NOFQDN NI_NOFQDN
+#else
+#define EVUTIL_NI_NOFQDN 0x40000
+#endif
+#if defined(NI_NAMEREQD) && defined(EVENT__HAVE_GETADDRINFO)
+#define EVUTIL_NI_NAMEREQD NI_NAMEREQD
+#else
+#define EVUTIL_NI_NAMEREQD 0x80000
+#endif
+#if defined(NI_DGRAM) && defined(EVENT__HAVE_GETADDRINFO)
+#define EVUTIL_NI_DGRAM NI_DGRAM
+#else
+#define EVUTIL_NI_DGRAM 0x100000
+#endif
+#if defined(NI_IDN) && defined(EVENT__HAVE_GETADDRINFO)
+#define EVUTIL_NI_IDN NI_IDN
+#else
+#define EVUTIL_NI_IDN 0x200000
+#endif
+#if defined(NI_IDN_ALLOW_UNASSIGNED) && defined(EVENT__HAVE_GETADDRINFO)
+#define EVUTIL_NI_IDN_ALLOW_UNASSIGNED NI_IDN_ALLOW_UNASSIGNED
+#else
+#define EVUTIL_NI_IDN_ALLOW_UNASSIGNED 0x400000
+#endif
+#if defined(NI_IDN_USE_STD3_ASCII_RULES) && defined(EVENT__HAVE_GETADDRINFO)
+#define EVUTIL_NI_IDN_USE_STD3_ASCII_RULES NI_IDN_USE_STD3_ASCII_RULES
+#else
+#define EVUTIL_NI_IDN_USE_STD3_ASCII_RULES 0x800000
+#endif
+
 /**@}*/
 
 struct evutil_addrinfo;
@@ -792,6 +834,22 @@ int evutil_getaddrinfo(const char *nodename, const char *servname,
 /** Release storage allocated by evutil_getaddrinfo or evdns_getaddrinfo. */
 EVENT2_EXPORT_SYMBOL
 void evutil_freeaddrinfo(struct evutil_addrinfo *ai);
+
+struct evutil_nameinfo;
+/**
+ * This function clones getnameinfo for systems that don't have it.  For full
+ * details, see RFC 3493, section 6.2.
+ *
+ * Limitations:
+ * - When the system has no getnameinfo, we fall back to gethostbyaddr_r or
+ *   gethostbyaddr, with their attendant issues.
+ *
+ * For a nonblocking variant, see evdns_getnameinfo.
+ */
+EVENT2_EXPORT_SYMBOL
+int evutil_getnameinfo(const struct sockaddr *sa, ev_socklen_t salen,
+    char *host, ev_socklen_t hostlen,
+    char *serv, ev_socklen_t servlen, int flags);
 
 EVENT2_EXPORT_SYMBOL
 const char *evutil_gai_strerror(int err);

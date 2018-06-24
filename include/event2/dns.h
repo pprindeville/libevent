@@ -663,8 +663,12 @@ int evdns_server_request_get_requesting_addr(struct evdns_server_request *req, s
 /** Callback for evdns_getaddrinfo. */
 typedef void (*evdns_getaddrinfo_cb)(int result, struct evutil_addrinfo *res, void *arg);
 
+/** Callback for evdns_getnameinfo. */
+typedef void (*evdns_getnameinfo_cb)(int result, struct evutil_nameinfo *res, void *arg);
+
 struct evdns_base;
 struct evdns_getaddrinfo_request;
+struct evdns_getnameinfo_request;
 /** Make a non-blocking getaddrinfo request using the dns_base in 'dns_base'.
  *
  * If we can answer the request immediately (with an error or not!), then we
@@ -694,6 +698,38 @@ struct evdns_getaddrinfo_request *evdns_getaddrinfo(
  * and the callback will be invoked with the error EVUTIL_EAI_CANCEL. */
 EVENT2_EXPORT_SYMBOL
 void evdns_getaddrinfo_cancel(struct evdns_getaddrinfo_request *req);
+
+/** Make a non-blocking getnameinfo request using the dns_base in 'dns_base'.
+ *
+ * If we can answer the request immediately (with an error or not!), then we
+ * invoke cb immediately and return NULL.  Otherwise we return
+ * an evdns_getnameinfo_request and invoke cb later.
+ *
+ * When the callback is invoked, we pass as its first argument the error code
+ * that getnameinfo would return (or 0 for no error).  As its second argument,
+ * we pass the evutil_nameinfo structures we found (or NULL on error).  We
+ * pass 'arg' as the third argument.
+ *
+ * Limitations:
+ *
+ * - The AI_V4MAPPED and AI_ALL flags are not currently implemented.
+ * - For ai_socktype, we only handle SOCKTYPE_STREAM, SOCKTYPE_UDP, and 0.
+ * - For ai_protocol, we only handle IPPROTO_TCP, IPPROTO_UDP, and 0.
+ */
+EVENT2_EXPORT_SYMBOL
+struct evdns_getnameinfo_request *evdns_getnameinfo(
+    struct evdns_base *dns_base,
+    const struct sockaddr *sa, socklen_t salen,
+    const char *host, size_t hostlen,
+    const char *serv, size_t servlen,
+    int flags,
+    evdns_getnameinfo_cb cb, void *arg);
+
+/* Cancel an in-progress evdns_getnameinfo.  This MUST NOT be called after the
+ * getnameinfo's callback has been invoked.  The resolves will be canceled,
+ * and the callback will be invoked with the error EVUTIL_EAI_CANCEL. */
+EVENT2_EXPORT_SYMBOL
+void evdns_getnameinfo_cancel(struct evdns_getnameinfo_request *req);
 
 /**
    Retrieve the address of the 'idx'th configured nameserver.
